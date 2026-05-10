@@ -736,3 +736,17 @@ func TestCloneOpenAIWSRawMessages(t *testing.T) {
 		require.Len(t, cloned, 0)
 	})
 }
+
+func TestOpenAIWSRawMessagesHaveFunctionCallOutput(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, openAIWSRawMessagesHaveFunctionCallOutput(nil))
+	require.False(t, openAIWSRawMessagesHaveFunctionCallOutput([]json.RawMessage{
+		json.RawMessage(`{"type":"input_text","text":"hello"}`),
+		json.RawMessage(`{"type":"message","role":"user"}`),
+	}))
+	require.True(t, openAIWSRawMessagesHaveFunctionCallOutput([]json.RawMessage{
+		json.RawMessage(`{"type":"input_text","text":"hello"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_1","output":"ok"}`),
+	}))
+}

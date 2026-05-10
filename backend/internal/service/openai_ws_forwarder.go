@@ -1444,6 +1444,15 @@ func cloneOpenAIWSRawMessages(items []json.RawMessage) []json.RawMessage {
 	return cloned
 }
 
+func openAIWSRawMessagesHaveFunctionCallOutput(items []json.RawMessage) bool {
+	for _, item := range items {
+		if gjson.GetBytes(item, "type").String() == "function_call_output" {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeOpenAIWSJSONForCompare(raw []byte) ([]byte, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
@@ -3117,6 +3126,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	currentTurnReplayInput := []json.RawMessage(nil)
 	currentTurnReplayInputExists := false
 	skipBeforeTurn := false
+	allowStrictAffinityDriftOnce := false
 	resetSessionLease := func(markBroken bool) {
 		if sessionLease == nil {
 			return
@@ -3139,7 +3149,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// 携带 function_call_output 的请求不能丢弃 previous_response_id：
 		// 上游 API 需要 response chain 来匹配 tool_result 与之前的 tool_use，
 		// 丢弃后会导致 "No tool call found for function call output" 400 错误。
-		if gjson.GetBytes(currentPayload, `input.#(type=="function_call_output")`).Exists() {
+		if gjson.GetBytes(currentPayload, `input.#(type=="function_call_output")`).Exists() ||
+			openAIWSRawMessagesHaveFunctionCallOutput(currentTurnReplayInput) {
 			return false
 		}
 		if isStrictAffinityTurn(currentPayload) {
@@ -3383,12 +3394,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 			}
 		}
-		forcePreferredConn := isStrictAffinityTurn(currentPayload)
+		forcePreferredConn := isStrictAffinityTurn(currentPayload) && !allowStrictAffinityDriftOnce
 		if sessionLease == nil {
 			acquiredLease, acquireErr := acquireTurnLease(turn, preferredConnID, forcePreferredConn)
 			if acquireErr != nil {
 				return fmt.Errorf("acquire upstream websocket: %w", acquireErr)
 			}
+			allowStrictAffinityDriftOnce = false
 			sessionLease = acquiredLease
 			sessionConnID = strings.TrimSpace(sessionLease.ConnID())
 			if storeDisabled {
@@ -3416,7 +3428,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					// 携带 function_call_output 的请求不能丢弃 previous_response_id：
 					// 上游 API 需要 response chain 来匹配 tool_result 与之前的 tool_use，
 					// 丢弃后会导致 "No tool call found for function call output" 400 错误。
-					hasFCOutput := gjson.GetBytes(currentPayload, `input.#(type=="function_call_output")`).Exists()
+					hasFCOutput := gjson.GetBytes(currentPayload, `input.#(type=="function_call_output")`).Exists() ||
+						openAIWSRawMessagesHaveFunctionCallOutput(currentTurnReplayInput)
 					if !turnPrevRecoveryTried && currentPreviousResponseID != "" && !hasFCOutput {
 						updatedPayload, removed, dropErr := dropPreviousResponseIDFromRawPayload(currentPayload)
 						if dropErr != nil || !removed {
@@ -3463,6 +3476,20 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 								continue
 							}
 						}
+					}
+					if hasFCOutput && !turnPrevRecoveryTried && currentPreviousResponseID != "" {
+						logOpenAIWSModeInfo(
+							"ingress_ws_preflight_ping_recovery account_id=%d turn=%d conn_id=%s action=keep_previous_response_id_retry_new_conn previous_response_id=%s",
+							account.ID,
+							turn,
+							truncateOpenAIWSLogValue(sessionConnID, openAIWSIDValueMaxLen),
+							truncateOpenAIWSLogValue(currentPreviousResponseID, openAIWSIDValueMaxLen),
+						)
+						turnPrevRecoveryTried = true
+						allowStrictAffinityDriftOnce = true
+						resetSessionLease(true)
+						skipBeforeTurn = true
+						continue
 					}
 					resetSessionLease(true)
 					return NewOpenAIWSClientCloseError(
